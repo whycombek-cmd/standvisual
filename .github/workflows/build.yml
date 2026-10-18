@@ -1,0 +1,445 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate project
+        run: |
+          mkdir -p proj/app/src/main/assets proj/app/src/main/java/com/dragon/standvisual
+          cd proj
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "StandVisual"
+          include(":app")
+          EOF
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > app/build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.dragon.standvisual"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.dragon.standvisual"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <!-- без этого Android 11+ не видит установленный Standoff 2 -->
+              <queries>
+                  <package android:name="com.axlebolt.standoff2" />
+              </queries>
+
+              <application
+                  android:label="Stand Visual"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="game_overlay" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/dragon/standvisual/MainActivity.kt << 'EOF'
+          package com.dragon.standvisual
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import android.widget.Toast
+          import org.json.JSONObject
+
+          private const val GAME = "com.axlebolt.standoff2"
+          private const val BG = 0xFF09090F.toInt()
+
+          class MainActivity : Activity() {
+
+              private lateinit var web: WebView
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = BG
+                  window.navigationBarColor = BG
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  }
+
+                  web = WebView(this).apply {
+                      setBackgroundColor(BG)
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      addJavascriptInterface(Bridge(), "Android")
+                      loadUrl("file:///android_asset/index.html")
+                  }
+                  setContentView(web)
+              }
+
+              /** Вызывается из HTML: Android.launchGame(json) */
+              inner class Bridge {
+
+                  @JavascriptInterface
+                  fun launchGame(json: String) {
+                      runOnUiThread {
+                          // 1. разрешение «Поверх других окон»
+                          if (!Settings.canDrawOverlays(this@MainActivity)) {
+                              toast("Разреши «Поверх других окон» и нажми запуск ещё раз")
+                              startActivity(
+                                  Intent(
+                                      Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                      Uri.parse("package:$packageName")
+                                  )
+                              )
+                              return@runOnUiThread
+                          }
+                          val cfg = JSONObject(json)
+
+                          // 2. растяг экрана (нужен root; без него — команда через ADB из приложения)
+                          val w = cfg.optInt("w")
+                          val h = cfg.optInt("h")
+                          if (w > 0 && h > 0) shell("wm size ${h}x$w")
+
+                          // 3. оверлей (снег, прицел, ватермарка, FPS/пинг)
+                          startForegroundService(
+                              Intent(this@MainActivity, OverlayService::class.java).putExtra("cfg", json)
+                          )
+
+                          // 4. сама игра
+                          Handler(Looper.getMainLooper()).postDelayed({ openGame() }, 400)
+                      }
+                  }
+
+                  @JavascriptInterface
+                  fun resetResolution() = shell("wm size reset")
+              }
+
+              private fun openGame() {
+                  val intent = packageManager.getLaunchIntentForPackage(GAME)
+                  if (intent == null) toast("Standoff 2 не установлен") else startActivity(intent)
+              }
+
+              private fun shell(cmd: String) {
+                  Thread {
+                      try {
+                          Runtime.getRuntime().exec(arrayOf("su", "-c", cmd)).waitFor()
+                      } catch (_: Exception) {
+                          // нет root — игнорируем, растяг можно применить через ADB
+                      }
+                  }.start()
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+          }
+          EOF
+          cat > app/src/main/java/com/dragon/standvisual/OverlayService.kt << 'EOF'
+          package com.dragon.standvisual
+
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.IBinder
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.WindowManager.LayoutParams.*
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+
+          class OverlayService : Service() {
+
+              private var overlay: WebView? = null
+              private var cfg = "{}"
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "STOP") {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  startForeground(1, buildNotification())
+                  cfg = intent?.getStringExtra("cfg") ?: "{}"
+                  if (overlay == null) show() else push()
+                  return START_NOT_STICKY
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun show() {
+                  val web = WebView(this).apply {
+                      setBackgroundColor(Color.TRANSPARENT)
+                      setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      webViewClient = object : WebViewClient() {
+                          override fun onPageFinished(view: WebView, url: String) = push()
+                      }
+                      loadUrl("file:///android_asset/index.html?overlay=1")
+                  }
+
+                  val lp = WindowManager.LayoutParams(
+                      MATCH_PARENT, MATCH_PARENT,
+                      TYPE_APPLICATION_OVERLAY,
+                      // не забирает фокус и пропускает все касания в игру
+                      FLAG_NOT_FOCUSABLE or FLAG_NOT_TOUCHABLE or FLAG_LAYOUT_IN_SCREEN or FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode = LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  }
+                  (getSystemService(WINDOW_SERVICE) as WindowManager).addView(web, lp)
+                  overlay = web
+              }
+
+              /** Передаём выбранные настройки в страницу оверлея */
+              private fun push() {
+                  overlay?.evaluateJavascript("S=Object.assign(S,$cfg);sync();", null)
+              }
+
+              private fun buildNotification(): Notification {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel("ov", "Оверлей", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stop = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, OverlayService::class.java).setAction("STOP"),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return Notification.Builder(this, "ov")
+                      .setSmallIcon(android.R.drawable.ic_menu_view)
+                      .setContentTitle("Stand Visual активен")
+                      .setContentText("Нажми «Остановить», чтобы убрать визуалы")
+                      .setOngoing(true)
+                      .addAction(Notification.Action.Builder(android.graphics.drawable.Icon.createWithResource(this, android.R.drawable.ic_delete), "Остановить", stop).build())
+                      .build()
+              }
+
+              override fun onDestroy() {
+                  overlay?.let {
+                      (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it)
+                      it.destroy()
+                  }
+                  overlay = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > app/src/main/assets/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="ru">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+          <title>Stand Visual by Dragon</title>
+          <style>
+          :root{--bg:#09090f;--card:#12121d;--line:#25253d;--tx:#ece9ff;--mut:#8b88b3;--p:#a855f7;--p2:#7c3aed;--glow:0 0 12px rgba(168,85,247,.7),0 0 30px rgba(124,58,237,.35);color-scheme:dark}
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+          html,body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,"Segoe UI",Roboto,sans-serif}
+          body{padding:env(safe-area-inset-top) 14px env(safe-area-inset-bottom);max-width:520px;margin:auto}
+          header{padding:18px 2px 4px}
+          h1{margin:0;font:900 30px/1 system-ui;letter-spacing:.04em}
+          h1 b{color:var(--p);text-shadow:var(--glow)}
+          header p{margin:6px 0 0;color:var(--mut);font-size:13px}
+          section{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin:12px 0}
+          h2{margin:0 0 12px;font:700 15px system-ui;color:#d8b4fe}
+          .chips{display:flex;flex-wrap:wrap;gap:8px}
+          .chip{padding:10px 16px;border-radius:10px;border:1px solid var(--line);background:#0d0d16;color:var(--mut);font:700 14px system-ui}
+          .chip.on{color:#fff;background:#2a1650;border-color:var(--p);box-shadow:var(--glow)}
+          #pv{display:flex;justify-content:center;margin-top:14px}
+          #stage{position:relative;overflow:hidden;height:170px;width:calc(170px*var(--r,1.78));max-width:100%;border:1px solid var(--p);border-radius:12px;box-shadow:var(--glow);background:linear-gradient(160deg,#1d1135,#090912 60%,#16091f);pointer-events:none}
+          #fx{position:absolute;inset:0;width:100%;height:100%}
+          #wm{position:absolute;left:9px;top:7px;font:800 12px system-ui;letter-spacing:.06em;color:#e9d5ff;text-shadow:0 0 6px var(--p),0 0 16px var(--p2)}
+          #hud{position:absolute;right:8px;top:7px;display:flex;gap:6px;transform-origin:top right}
+          #hud i{font:700 11px ui-monospace,monospace;font-style:normal;padding:3px 7px;border-radius:7px;background:rgba(9,9,15,.75);border:1px solid var(--p);color:#e9d5ff;box-shadow:0 0 8px rgba(168,85,247,.5)}
+          .info{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:12px;font-size:13px;color:var(--mut)}
+          .info b{color:var(--tx)}
+          .code{font:12px ui-monospace,monospace;color:#d8b4fe;background:#0b0b14;border:1px dashed var(--p2);border-radius:8px;padding:8px 10px}
+          small{display:block;margin-top:8px;color:var(--mut);font-size:12px}
+          .row{display:flex;justify-content:space-between;color:var(--mut);font-size:13px}
+          .row b{color:var(--tx)}
+          input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:9px;margin:10px 0 16px;outline:0;background:linear-gradient(90deg,var(--p) var(--f,50%),var(--line) var(--f,50%))}
+          input.hue{background:linear-gradient(90deg,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)}
+          input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;height:24px;border-radius:50%;background:var(--p);border:2px solid #fff4;box-shadow:var(--glow)}
+          .bar{position:sticky;bottom:0;padding:22px 0 calc(env(safe-area-inset-bottom) + 12px);background:linear-gradient(transparent,var(--bg) 40%)}
+          .go{width:100%;padding:18px 12px;border:0;border-radius:14px;font:800 16px/1.2 system-ui;color:#fff;background:linear-gradient(135deg,var(--p2),var(--p));box-shadow:var(--glow);animation:pulse 2.4s ease-in-out infinite}
+          .go:active{transform:scale(.98)}
+          @keyframes pulse{50%{box-shadow:0 0 22px rgba(168,85,247,.95),0 0 56px rgba(124,58,237,.55)}}
+          #toast{min-height:18px;text-align:center;color:var(--mut);font-size:12px;margin-top:8px}
+          html.ov,html.ov body{background:transparent;padding:0;max-width:none;overflow:hidden}
+          html.ov #ui{display:none}
+          html.ov #stage{position:fixed;inset:0;width:auto;height:auto;max-width:none;border:0;border-radius:0;box-shadow:none;background:none}
+          html.ov #wm{font-size:15px;left:calc(env(safe-area-inset-left) + 16px);top:calc(env(safe-area-inset-top) + 10px)}
+          html.ov #hud{right:calc(env(safe-area-inset-right) + 16px);top:calc(env(safe-area-inset-top) + 10px)}
+          @media (prefers-reduced-motion:reduce){.go{animation:none}}
+          </style>
+          </head>
+          <body>
+          <main id="ui">
+          <header><h1>Stand<b>Visual</b></h1><p>by dragon · визуалы для Standoff 2</p></header>
+
+          <section>
+          <h2>Растяг экрана</h2>
+          <div id="ratios" class="chips"></div>
+          <div id="pv"><div id="stage"><canvas id="fx"></canvas><div id="wm">stand visual by dragon</div><div id="hud"><i id="hf">FPS 0</i><i id="hp">PING —</i></div></div></div>
+          <div class="info"><span>Разрешение <b id="res"></b></span><button id="cmd" class="code"></button></div>
+          <small>В APK растяг применяет Shizuku/root. Без них: нажми на команду, чтобы скопировать, и выполни через ADB. Сброс: adb shell wm size reset</small>
+          </section>
+
+          <section><h2>Что показывать</h2><div id="toggles" class="chips"></div></section>
+          <div id="sliders"></div>
+
+          <div class="bar"><button id="go" class="go">Запустить Standoff 2 с выбранными визуалами</button><div id="toast"></div></div>
+          </main>
+
+          <script>
+          const $=s=>document.querySelector(s),OV=/overlay/.test(location.search);
+          const D={ratio:'16:9',cs:20,ct:2,cg:6,ca:90,ch:285,cd:true,fps:true,ping:true,hs:1,ha:90,snow:true,sn:110,ss:1,wm:true};
+          const R=['4:3','5:4','16:9','3:2','1:1'];
+          const TG=[['cd','Точка прицела'],['fps','FPS'],['ping','Пинг'],['snow','Снег'],['wm','Ватермарка']];
+          const SL=[['Прицел',[['cs','Размер',2,40,1,' px'],['ct','Толщина',1,8,1,' px'],['cg','Зазор',0,24,1,' px'],['ca','Прозрачность',10,100,1,'%'],['ch','Цвет',0,360,1,'°']]],
+          ['FPS и пинг',[['hs','Масштаб',.6,2,.1,'×'],['ha','Прозрачность',20,100,1,'%']]],
+          ['Снег',[['sn','Количество',0,300,10,''],['ss','Скорость',.3,3,.1,'×']]]];
+          const load=()=>{try{return{...D,...JSON.parse(localStorage.getItem('sv')||'{}')}}catch(e){return{...D}}};
+          let S=load();
+          const save=()=>{try{localStorage.setItem('sv',JSON.stringify(S))}catch(e){}};
+          const toast=m=>$('#toast').textContent=m;
+
+          $('#ratios').innerHTML=R.map(r=>`<button class=chip data-r=${r}>${r}</button>`).join('');
+          $('#toggles').innerHTML=TG.map(([k,l])=>`<button class=chip data-t=${k}>${l}</button>`).join('');
+          $('#sliders').innerHTML=SL.map(([g,a])=>`<section><h2>${g}</h2>`+a.map(([k,l,mn,mx,st])=>`<div class=row><span>${l}</span><b id=v_${k}></b></div><input type=range id=${k} min=${mn} max=${mx} step=${st} ${k=='ch'?'class=hue':''}>`).join('')+'</section>').join('');
+          $('#ratios').onclick=e=>{const r=e.target.dataset.r;if(r){S.ratio=r;sync()}};
+          $('#toggles').onclick=e=>{const k=e.target.dataset.t;if(k){S[k]=!S[k];sync()}};
+          document.querySelectorAll('input[type=range]').forEach(i=>{i.value=S[i.id];i.oninput=()=>{S[i.id]=+i.value;sync()}});
+          $('#cmd').onclick=()=>{try{navigator.clipboard.writeText($('#cmd').textContent);toast('Команда скопирована')}catch(e){}};
+
+          function res(){
+            const d=devicePixelRatio||1,sh=Math.round(Math.min(screen.width,screen.height)*d/2)*2,[a,b]=S.ratio.split(':'),w=Math.round(sh*a/b/2)*2;
+            $('#res').textContent=`≈ ${w}×${sh}`;$('#cmd').textContent=`adb shell wm size ${sh}x${w}`;
+            return{w,h:sh};
+          }
+          function sync(){
+            for(const[,a]of SL)for(const[k,,mn,mx,,u]of a){$('#v_'+k).textContent=S[k]+u;$('#'+k).style.setProperty('--f',(S[k]-mn)/(mx-mn)*100+'%')}
+            document.querySelectorAll('[data-r]').forEach(b=>b.classList.toggle('on',b.dataset.r==S.ratio));
+            document.querySelectorAll('[data-t]').forEach(b=>b.classList.toggle('on',!!S[b.dataset.t]));
+            const[a,b]=S.ratio.split(':');$('#stage').style.setProperty('--r',a/b);
+            $('#wm').style.display=S.wm?'':'none';$('#hf').style.display=S.fps?'':'none';$('#hp').style.display=S.ping?'':'none';
+            $('#hud').style.transform=`scale(${S.hs})`;$('#hud').style.opacity=S.ha/100;
+            res();seed();if(!OV)save();
+          }
+
+          /* ---- эффекты: снег + прицел ---- */
+          const cv=$('#fx'),cx=cv.getContext('2d');let F=[],W=0,H=0;
+          const flake=r=>({x:Math.random()*W,y:r?Math.random()*H:-5,r:Math.random()*2.2+.8,v:Math.random()*.8+.5,p:Math.random()*6.28});
+          function seed(){const n=S.snow?S.sn:0;while(F.length<n)F.push(flake(true));F.length=n}
+          function fit(){const dp=Math.min(devicePixelRatio||1,2),r=cv.getBoundingClientRect();W=r.width;H=r.height;cv.width=W*dp;cv.height=H*dp;cx.setTransform(dp,0,0,dp,0,0);F=[];seed()}
+          function cross(){
+            const k=OV?1:H/360,x=W/2,y=H/2,s=S.cs*k,t=Math.max(1,S.ct*k),g=S.cg*k;
+            const rs=[[x-g-s,y-t/2,s,t],[x+g,y-t/2,s,t],[x-t/2,y-g-s,t,s],[x-t/2,y+g,t,s]];
+            if(S.cd)rs.push([x-t/2,y-t/2,t,t]);
+            cx.globalAlpha=S.ca/100;cx.fillStyle='#000';rs.forEach(r=>cx.fillRect(r[0]-1,r[1]-1,r[2]+2,r[3]+2));
+            cx.fillStyle=`hsl(${S.ch},100%,60%)`;rs.forEach(r=>cx.fillRect(...r));cx.globalAlpha=1;
+          }
+          let t0=performance.now(),fc=0,last=t0;
+          function loop(t){
+            const dt=Math.min((t-last)/16.7,3);last=t;cx.clearRect(0,0,W,H);cx.fillStyle='#fff';
+            for(const f of F){f.y+=f.v*S.ss*dt*1.4;f.p+=.02*dt;f.x=(f.x+Math.sin(f.p)*.4*dt+W)%W;
+              if(f.y>H+4){f.y=-4;f.x=Math.random()*W}
+              cx.globalAlpha=.5+f.r/6;cx.beginPath();cx.arc(f.x,f.y,f.r*(OV?1.3:1),0,6.283);cx.fill()}
+            cx.globalAlpha=1;cross();
+            fc++;if(t-t0>=500){$('#hf').textContent='FPS '+Math.round(fc*1000/(t-t0));fc=0;t0=t}
+            requestAnimationFrame(loop);
+          }
+          async function ping(){
+            const c=new AbortController(),t=performance.now(),id=setTimeout(()=>c.abort(),2500);
+            try{await fetch('https://www.gstatic.com/generate_204',{mode:'no-cors',cache:'no-store',signal:c.signal});$('#hp').textContent='PING '+Math.round(performance.now()-t)+' ms'}
+            catch(e){$('#hp').textContent='PING —'}
+            clearTimeout(id);
+          }
+
+          /* ---- запуск игры ---- */
+          function launch(){
+            save();const r=res(),cfg=JSON.stringify({...S,w:r.w,h:r.h});
+            if(window.Android&&Android.launchGame){Android.launchGame(cfg);toast('Применяю настройки и запускаю Standoff 2…')}
+            else{toast('Нет APK-моста: открываю игру без оверлея');try{location.href='intent:#Intent;action=android.intent.action.MAIN;category=android.intent.category.LAUNCHER;package=com.axlebolt.standoff2;end'}catch(e){}}
+          }
+          $('#go').onclick=launch;
+
+          /* ---- режим оверлея: ?overlay=1 ---- */
+          if(OV){document.documentElement.classList.add('ov');document.body.appendChild($('#stage'));addEventListener('storage',()=>{S=load();sync()})}
+          new ResizeObserver(fit).observe($('#stage'));
+          sync();ping();setInterval(ping,3000);requestAnimationFrame(loop);
+          </script>
+          </body>
+          </html>
+          EOF
+      - name: Build
+        run: cd proj && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StandVisual-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
